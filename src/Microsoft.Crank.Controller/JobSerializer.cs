@@ -11,38 +11,134 @@ using Newtonsoft.Json.Serialization;
 using System.Net.Http;
 using System.Text;
 using System.Net;
+using Npgsql;
+using NpgsqlTypes;
 
 namespace Microsoft.Crank.Controller.Serializers
 {
     public class JobSerializer
     {
         public static Task WriteJobResultsToSqlAsync(
-            JobResults jobResults, 
-            string sqlConnectionString, 
+            JobResults jobResults,
+            string connectionType,
+            string sqlConnectionString,
             string tableName,
             string session,
             string scenario,
             string description
-            )
+        )
+        {
+            if (connectionType.Equals("postgres", StringComparison.InvariantCultureIgnoreCase))
+            {
+                return WriteJobResultsToPostgreSqlServerAsync(jobResults, sqlConnectionString, tableName, session,
+                    scenario, description);
+            }
+
+            return WriteJobResultsToMicrosoftSqlServerAsync(jobResults, sqlConnectionString, tableName, session,
+                scenario, description);
+        }
+
+        private static Task WriteJobResultsToPostgreSqlServerAsync(
+            JobResults jobResults,
+            string sqlConnectionString,
+            string tableName,
+            string session,
+            string scenario,
+            string description
+        )
         {
             var utcNow = DateTime.UtcNow;
 
-            var document = JsonConvert.SerializeObject(jobResults, Formatting.None, new JsonSerializerSettings { ContractResolver = new CamelCasePropertyNamesContractResolver() });
+            var document = JsonConvert.SerializeObject(jobResults, Formatting.None,
+                new JsonSerializerSettings {ContractResolver = new CamelCasePropertyNamesContractResolver()});
 
             return RetryOnExceptionAsync(5, () =>
-                 WriteResultsToSql(
-                    utcNow,
-                    sqlConnectionString,
-                    tableName,
-                    session,
-                    scenario,
-                    description,
-                    document
+                    WriteResultsToPostgreSqlServer(
+                        utcNow,
+                        sqlConnectionString,
+                        tableName,
+                        session,
+                        scenario,
+                        description,
+                        document
                     )
                 , 5000);
         }
 
-        public static async Task InitializeDatabaseAsync(string connectionString, string tableName)
+        private static Task WriteJobResultsToMicrosoftSqlServerAsync(
+            JobResults jobResults,
+            string sqlConnectionString,
+            string tableName,
+            string session,
+            string scenario,
+            string description
+        )
+        {
+            var utcNow = DateTime.UtcNow;
+
+            var document = JsonConvert.SerializeObject(jobResults, Formatting.None,
+                new JsonSerializerSettings {ContractResolver = new CamelCasePropertyNamesContractResolver()});
+
+            return RetryOnExceptionAsync(5, () =>
+                    WriteResultsToMicrosoftSqlServer(
+                        utcNow,
+                        sqlConnectionString,
+                        tableName,
+                        session,
+                        scenario,
+                        description,
+                        document
+                    )
+                , 5000);
+        }
+
+        public static async Task InitializeDatabaseAsync(string connectionType, string connectionString,
+            string tableName)
+        {
+            Console.WriteLine($"Initialize {connectionType}");
+            if (connectionType == "postgres")
+            {
+                await InitializePostgreSqlServerDatabaseAsync(connectionString, tableName);
+            }
+            else
+            {
+                await InitializeMicrosoftSqlServerDatabaseAsync(connectionString, tableName);
+            }
+        }
+
+        private static async Task InitializePostgreSqlServerDatabaseAsync(string connectionString, string tableName)
+        {
+            var createCmd =
+                @$"
+                    create table if not exists {tableName} (
+                         Id INTEGER Primary Key Generated Always as Identity,
+ 						 Excluded bit NOT NULL DEFAULT cast(0 as bit),
+   						 DateTimeUtc timestamp without time zone NOT NULL,                      
+						 Session varchar(200) NOT NULL,
+						 Scenario varchar(200) NOT NULL,
+						 Description varchar(200) NOT NULL,
+						 Document json NOT NULL
+                     );";
+
+
+            await RetryOnExceptionAsync(5,
+                () => InitializePostgreSqlServerDatabaseInternalAsync(connectionString, createCmd), 5000);
+
+            static async Task InitializePostgreSqlServerDatabaseInternalAsync(string connectionString, string createCmd)
+            {
+                using (var connection = new NpgsqlConnection(connectionString))
+                {
+                    await connection.OpenAsync();
+
+                    using (var command = new NpgsqlCommand(createCmd, connection))
+                    {
+                        await command.ExecuteNonQueryAsync();
+                    }
+                }
+            }
+        }
+
+        private static async Task InitializeMicrosoftSqlServerDatabaseAsync(string connectionString, string tableName)
         {
             var createCmd =
                 @"
@@ -60,9 +156,12 @@ namespace Microsoft.Crank.Controller.Serializers
                 END
                 ";
 
-            await RetryOnExceptionAsync(5, () => InitializeDatabaseInternalAsync(connectionString, createCmd), 5000);
 
-            static async Task InitializeDatabaseInternalAsync(string connectionString, string createCmd)
+            await RetryOnExceptionAsync(5,
+                () => InitializeMicrosoftSqlServerDatabaseInternalAsync(connectionString, createCmd), 5000);
+
+            static async Task InitializeMicrosoftSqlServerDatabaseInternalAsync(string connectionString,
+                string createCmd)
             {
                 using (var connection = new SqlConnection(connectionString))
                 {
@@ -76,7 +175,7 @@ namespace Microsoft.Crank.Controller.Serializers
             }
         }
 
-        private static async Task WriteResultsToSql(
+        private static async Task WriteResultsToPostgreSqlServer(
             DateTime utcNow,
             string connectionString,
             string tableName,
@@ -84,9 +183,65 @@ namespace Microsoft.Crank.Controller.Serializers
             string scenario,
             string description,
             string document
-            )
+        )
         {
+            var insertCmd =
+                @$"
+                INSERT INTO {tableName}
+                           (DateTimeUtc
+                           ,Session
+                           ,Scenario
+                           ,Description
+                           ,Document)
+                     VALUES
+                           (@DateTimeUtc
+                           ,@Session
+                           ,@Scenario
+                           ,@Description
+                           ,@Document)
+                ";
 
+            using (var connection = new NpgsqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                var transaction = connection.BeginTransaction();
+
+                try
+                {
+                    var command = new NpgsqlCommand(insertCmd, connection, transaction);
+                    var p = command.Parameters;
+                    p.AddWithValue("@DateTimeUtc", utcNow);
+                    p.AddWithValue("@Session", session);
+                    p.AddWithValue("@Scenario", scenario ?? "");
+                    p.AddWithValue("@Description", description ?? "");
+                    p.AddWithValue("@Document", NpgsqlDbType.Json, document);
+
+                    await command.ExecuteNonQueryAsync();
+
+                    transaction.Commit();
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
+                finally
+                {
+                    transaction.Dispose();
+                }
+            }
+        }
+        
+        private static async Task WriteResultsToMicrosoftSqlServer(
+            DateTime utcNow,
+            string connectionString,
+            string tableName,
+            string session,
+            string scenario,
+            string description,
+            string document
+        )
+        {
             var insertCmd =
                 @"
                 INSERT INTO [dbo].[" + tableName + @"]
@@ -133,33 +288,34 @@ namespace Microsoft.Crank.Controller.Serializers
                 }
             }
         }
- public static Task WriteJobResultsToEsAsync(
-                 JobResults jobResults,
-                 string elasticSearchUrl,
-                 string indexName,
-                 string session,
-                 string scenario,
-                 string description
-                 )
-      {
-          var utcNow = DateTime.UtcNow;
-          return RetryOnExceptionAsync(5, () =>
-               WriteResultsToEs(
-                  utcNow,
-                  elasticSearchUrl,
-                  indexName,
-                  session,
-                  scenario,
-                  description,
-                  jobResults
-                  )
-              , 5000);
-      }
 
-      public static async Task InitializeElasticSearchAsync(string elasticSearchUrl, string indexName)
-      {
-          var mappingQuery =
-              @"{""settings"": {""number_of_shards"": 1},""mappings"": { ""dynamic"": false, 
+        public static Task WriteJobResultsToEsAsync(
+            JobResults jobResults,
+            string elasticSearchUrl,
+            string indexName,
+            string session,
+            string scenario,
+            string description
+        )
+        {
+            var utcNow = DateTime.UtcNow;
+            return RetryOnExceptionAsync(5, () =>
+                    WriteResultsToEs(
+                        utcNow,
+                        elasticSearchUrl,
+                        indexName,
+                        session,
+                        scenario,
+                        description,
+                        jobResults
+                    )
+                , 5000);
+        }
+
+        public static async Task InitializeElasticSearchAsync(string elasticSearchUrl, string indexName)
+        {
+            var mappingQuery =
+                @"{""settings"": {""number_of_shards"": 1},""mappings"": { ""dynamic"": false, 
               ""properties"": {
               ""DateTimeUtc"": { ""type"": ""date"" },
               ""Session"": { ""type"": ""keyword"" },
@@ -167,54 +323,61 @@ namespace Microsoft.Crank.Controller.Serializers
               ""Description"": { ""type"": ""keyword"" },
               ""Document"": { ""type"": ""nested"" }}}}";
 
-          await RetryOnExceptionAsync(5, () => InitializeDatabaseInternalAsync(elasticSearchUrl,indexName, mappingQuery), 5000);
+            await RetryOnExceptionAsync(5,
+                () => InitializeDatabaseInternalAsync(elasticSearchUrl, indexName, mappingQuery), 5000);
 
-          static async Task InitializeDatabaseInternalAsync(string elasticSearchUrl,string indexName, string mappingQuery)
-          {
-              using (var httpClient = new HttpClient())
-              {
-                  HttpResponseMessage hrm = await httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Head, $"{elasticSearchUrl}/{indexName.ToLower()}"));
-                  if (hrm.StatusCode == HttpStatusCode.NotFound)
-                  {
-                      hrm = await httpClient.PutAsync($"{elasticSearchUrl}/{indexName.ToLower()}", new StringContent(mappingQuery, Encoding.UTF8, "application/json"));
-                      if (hrm.StatusCode != HttpStatusCode.OK)
-                      {
-                          throw new System.Exception(await hrm.Content.ReadAsStringAsync());
-                      }
-                  }
-              }
-          }
-      }
+            static async Task InitializeDatabaseInternalAsync(string elasticSearchUrl, string indexName,
+                string mappingQuery)
+            {
+                using (var httpClient = new HttpClient())
+                {
+                    HttpResponseMessage hrm = await httpClient.SendAsync(
+                        new HttpRequestMessage(HttpMethod.Head, $"{elasticSearchUrl}/{indexName.ToLower()}"));
+                    if (hrm.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        hrm = await httpClient.PutAsync($"{elasticSearchUrl}/{indexName.ToLower()}",
+                            new StringContent(mappingQuery, Encoding.UTF8, "application/json"));
+                        if (hrm.StatusCode != HttpStatusCode.OK)
+                        {
+                            throw new System.Exception(await hrm.Content.ReadAsStringAsync());
+                        }
+                    }
+                }
+            }
+        }
 
-      private static async Task WriteResultsToEs(
-          DateTime utcNow,
-          string elasticSearchUrl,
-          string indexName,
-          string session,
-          string scenario,
-          string description,
-          JobResults jobResults
-          )
-      {
-          var result = new
-          {
-              DateTimeUtc = utcNow,
-              Session = session,
-              Scenario = scenario,
-              Description = description,
-              Document = jobResults
-          };
+        private static async Task WriteResultsToEs(
+            DateTime utcNow,
+            string elasticSearchUrl,
+            string indexName,
+            string session,
+            string scenario,
+            string description,
+            JobResults jobResults
+        )
+        {
+            var result = new
+            {
+                DateTimeUtc = utcNow,
+                Session = session,
+                Scenario = scenario,
+                Description = description,
+                Document = jobResults
+            };
 
-          using (var httpClient = new HttpClient())
-          {
-              var item = JsonConvert.SerializeObject(result, Formatting.None, new JsonSerializerSettings { ContractResolver = new CamelCasePropertyNamesContractResolver() });
-              HttpResponseMessage hrm = await httpClient.PostAsync(elasticSearchUrl+"/"+indexName.ToLower() + "/_doc/" + session, new StringContent(item.ToString(), Encoding.UTF8, "application/json"));
-              if (!hrm.IsSuccessStatusCode)
-              {
-                  throw new Exception(hrm.RequestMessage?.ToString());
-              }
-          }
-      }
+            using (var httpClient = new HttpClient())
+            {
+                var item = JsonConvert.SerializeObject(result, Formatting.None,
+                    new JsonSerializerSettings {ContractResolver = new CamelCasePropertyNamesContractResolver()});
+                HttpResponseMessage hrm = await httpClient.PostAsync(
+                    elasticSearchUrl + "/" + indexName.ToLower() + "/_doc/" + session,
+                    new StringContent(item.ToString(), Encoding.UTF8, "application/json"));
+                if (!hrm.IsSuccessStatusCode)
+                {
+                    throw new Exception(hrm.RequestMessage?.ToString());
+                }
+            }
+        }
 
         private async static Task RetryOnExceptionAsync(int retries, Func<Task> operation, int milliSecondsDelay = 0)
         {

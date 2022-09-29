@@ -38,6 +38,7 @@ namespace Microsoft.Crank.Controller
 
         private static string _tableName = "Benchmarks";
         private static string _sqlConnectionString = "";
+        private static string _sqlConnectionType = "";
         private static string _indexName = "benchmarks";
         private static string _elasticSearchUrl = "";
         private const string DefaultBenchmarkDotNetArguments = "--inProcess --cli {{benchmarks-cli}} --join --exporters briefjson markdown";
@@ -57,6 +58,7 @@ namespace Microsoft.Crank.Controller
             _csvOption,
             _compareOption,
             _variableOption,
+            _sqlConnectionTypeOption,
             _sqlConnectionStringOption,
             _sqlTableOption,
             _elastiSearchUrlOption,
@@ -159,6 +161,7 @@ namespace Microsoft.Crank.Controller
             _csvOption = app.Option("--csv", "Saves the results as csv in the specified file.", CommandOptionType.SingleValue);
             _compareOption = app.Option("--compare", "An optional filename to compare the results to. Can be used multiple times.", CommandOptionType.MultipleValue);
             _variableOption = app.Option("--variable", "Variable", CommandOptionType.MultipleValue);
+            _sqlConnectionTypeOption = app.Option("--sqlType","Database type or environment variable name of the SQL Database Type to use to store results in. Allowed values ms or postgres", CommandOptionType.SingleValue);
             _sqlConnectionStringOption = app.Option("--sql",
                 "Connection string or environment variable name of the SQL Server Database to store results in.", CommandOptionType.SingleValue);
             _sqlTableOption = app.Option("--table",
@@ -193,6 +196,7 @@ namespace Microsoft.Crank.Controller
                 _jsonOption,
                 _csvOption,
                 _compareOption,
+                _sqlConnectionTypeOption,
                 _sqlConnectionStringOption,
                 _sqlTableOption,
                 _elastiSearchUrlOption,
@@ -419,6 +423,16 @@ namespace Microsoft.Crank.Controller
                     }
                 }
 
+                if (_sqlConnectionTypeOption.HasValue())
+                {
+                    _sqlConnectionType = _sqlConnectionTypeOption.Value();
+                    Console.WriteLine(_sqlConnectionType);
+                    if (!String.IsNullOrEmpty(Environment.GetEnvironmentVariable(_sqlConnectionType)))
+                    {
+                        _sqlConnectionType = Environment.GetEnvironmentVariable(_sqlConnectionType);
+                    }
+                }
+                
                 if (_sqlConnectionStringOption.HasValue())
                 {
                     _sqlConnectionString = _sqlConnectionStringOption.Value();
@@ -591,9 +605,9 @@ namespace Microsoft.Crank.Controller
                 }
 
                 // Initialize database
-                if (!String.IsNullOrWhiteSpace(_sqlConnectionString))
+                if (!String.IsNullOrWhiteSpace(_sqlConnectionString) && !String.IsNullOrWhiteSpace(_sqlConnectionType))
                 {
-                    await JobSerializer.InitializeDatabaseAsync(_sqlConnectionString, _tableName);
+                    await JobSerializer.InitializeDatabaseAsync(_sqlConnectionType, _sqlConnectionString, _tableName);
                 }
 
                 // Initialize elasticsearch index
@@ -1222,12 +1236,12 @@ namespace Microsoft.Crank.Controller
 
                 // Store data
 
-                if (!String.IsNullOrEmpty(_sqlConnectionString))
+                if (!String.IsNullOrEmpty(_sqlConnectionString) && !String.IsNullOrEmpty(_sqlConnectionType))
                 {
                     // Skip storing results if running with iterations and not the last run
                     if (i == iterations)
                     {
-                        await JobSerializer.WriteJobResultsToSqlAsync(executionResult.JobResults, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), _descriptionOption.Value());
+                        await JobSerializer.WriteJobResultsToSqlAsync(executionResult.JobResults, _sqlConnectionType, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), _descriptionOption.Value());
                     }
                 }
 
@@ -1430,12 +1444,12 @@ namespace Microsoft.Crank.Controller
 
                 CleanMeasurements(jobResults);
 
-                if (!String.IsNullOrEmpty(_sqlConnectionString))
+                if (!String.IsNullOrEmpty(_sqlConnectionString) && !String.IsNullOrEmpty(_sqlConnectionType))
                 {
                     var executionResult = new ExecutionResult();
                     executionResult.JobResults = jobResults;
 
-                    await JobSerializer.WriteJobResultsToSqlAsync(executionResult.JobResults, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), String.Join(" ", _descriptionOption.Value(), fullName));
+                    await JobSerializer.WriteJobResultsToSqlAsync(executionResult.JobResults, _sqlConnectionType, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), String.Join(" ", _descriptionOption.Value(), fullName));
                 }
                 if (!String.IsNullOrEmpty(_elasticSearchUrl))
                 {
@@ -1579,9 +1593,9 @@ namespace Microsoft.Crank.Controller
 
                     // Store data
 
-                    if (!String.IsNullOrEmpty(_sqlConnectionString))
+                    if (!String.IsNullOrEmpty(_sqlConnectionString) && !String.IsNullOrEmpty(_sqlConnectionType))
                     {
-                        await JobSerializer.WriteJobResultsToSqlAsync(jobResults, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), _descriptionOption.Value());
+                        await JobSerializer.WriteJobResultsToSqlAsync(jobResults, _sqlConnectionType, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), _descriptionOption.Value());
                     }
 
                     if (!String.IsNullOrEmpty(_elasticSearchUrl))
